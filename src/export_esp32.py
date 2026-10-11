@@ -155,7 +155,7 @@ def main(argv: list[str] | None = None) -> None:
     ckpt, out = Path(a.ckpt), Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    samples = dataset.load_samples(a.data)
+    samples = dataset.load_samples(a.data, **dataset.load_options(cfg))
     split = dataset.load_split(ckpt.parent / "split.json", samples)
     calib_x, _ = dataset.LogMelDataset([samples[i] for i in split["train"]]).arrays()
     calib = pick_calibration(calib_x, cfg["export"]["calib_clips"])

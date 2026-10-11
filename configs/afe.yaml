@@ -33,5 +33,8 @@ train:
 data:
   min_per_jamo: 25                # per participant (spec §7)
   min_per_special: 25             # assumption: spec leaves the special-token minimum open (O-Q6)
+  sessions: null                  # null = every labels/*.csv; or a list of session ids to use
+  on_missing_mel: error           # error | drop: a label row without a log-mel (the Mel component skipped it)
+  require_param_hash: false       # true: data without a param_hash (mel/_meta.json or shard header) is refused
 eval:
   n_bins: 15                      # ECE bins

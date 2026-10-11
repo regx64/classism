@@ -30,6 +30,8 @@ pip install -r requirements-export.txt     # + ONNX / TensorFlow / onnx2tf, only
 ```bash
 # data layout:  <data>/labels/<session>.csv   (onset_s,jamo,keytype,shift,scenario,participant[,clip_id])
 #               <data>/mel/<clip_id>.npy      (float32 (64,48), final z-scored log-mel from the Mel component)
+#               <data>/mel/_meta.json         (Mel header; its param_hash is checked against the frozen regime)
+#               <data>/mel_packed/<session>.npz  (optional session shard: logmel (N,64,48), clip_id (N,), param_hash)
 python -m src.dataset  --data data/                       # T8: coverage check (>=25 per jamo per participant, per special token)
 python -m src.train    --data data/ --out runs/a          # T4
 python -m src.evaluate --ckpt runs/a/best.pt --data data/ # T6 (+ fits T, writes runs/a/calibration.json)  -> runs/a/eval_test/
@@ -47,6 +49,12 @@ Tests that run a real tiny model are marked `torch` (`-m "not torch"` skips them
 ## Decisions where the spec is silent (change if wrong)
 - **`param_hash`**: first 8 hex of sha256 over the canonical JSON of the frozen `Regime`. The Mel component must produce the same
   value (O-O3); a session with a different hash is rejected (NFR-2). Pass `verify_hash=False` only while agreeing on this.
+  Training data is checked too: `load_samples` reads each session's hash from its shard header, else `mel/_meta.json`,
+  and raises `RegimeError` on a mismatch; data without any hash only warns unless `data.require_param_hash: true`.
+- **Session shards** (`mel_packed/<session>.npz`): read instead of the per-clip `.npy` files when present, so tens of
+  thousands of clips are a handful of files. `data.sessions` limits training to listed sessions, and
+  `data.on_missing_mel: drop` leaves out label rows the Mel component could not cut (it reports them), instead of failing.
+  `python -m src.dataset --json out.json` writes the check (coverage, hash, sessions); exit 3 = hash mismatch.
 - **Label CSV → clip**: `clip_id` column if present, else `<session_id>_<row:05d>`; `session_id` = CSV file stem.
 - **`alts` length**: always exactly `topN` (the spec's example shows one alt for `<sp>`; the schema allows 1..38 but the AFE emits N).
 - **`model_id`**: `<model>-fp32-v1` for the PyTorch model; the int8 deployment is identified by `deployment.json`.

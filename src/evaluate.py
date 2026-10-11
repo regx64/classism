@@ -185,7 +185,7 @@ def main(argv: list[str] | None = None) -> None:
     ckpt = Path(a.ckpt)
     out = Path(a.out) if a.out else ckpt.parent / f"eval_{a.split}"
 
-    samples = dataset.load_samples(a.data)
+    samples = dataset.load_samples(a.data, **dataset.load_options(cfg))
     split = dataset.load_split(ckpt.parent / "split.json", samples)
     predictor, _ = infer.load_predictor(ckpt)
     bs = cfg["infer"]["batch_size"]

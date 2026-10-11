@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from . import labels
-from .melio import REGIME
+from .melio import MEL_SPEC_VERSION, REGIME
 
 SCENARIOS = {"near": 0.6, "far": 1.2, "noise": 1.8}  # noise sigma
 _SHIFTED = set("ㄲㄸㅃㅆㅉㅒㅖ")
@@ -70,6 +70,10 @@ def generate(out: str | Path, participants: int = 3, sessions_per_scenario: int 
                         w.writerow([f"{t:.3f}", sym if kt == "normal" else "", kt,
                                     int(sym in _SHIFTED or kt == "shift"), scen, f"p{p + 1}", cid])
     (out / "meta.json").write_text(json.dumps({"synthetic": True, "param_hash": REGIME.param_hash(), "seed": seed}), encoding="utf-8")
+    # the Mel component's header (§3.1): lets load_samples verify the regime (NFR-2)
+    (out / "mel" / "_meta.json").write_text(json.dumps({
+        "mel_spec_version": MEL_SPEC_VERSION, "param_hash": REGIME.param_hash(), "sample_rate": REGIME.sample_rate,
+        "n_mels": REGIME.n_mels, "frames": REGIME.frames, "synthetic": True}), encoding="utf-8")
     return out
 
 

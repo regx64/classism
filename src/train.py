@@ -56,7 +56,7 @@ def train(cfg: dict, data_root: str | Path, out_dir: str | Path, *, epochs: int 
     out.mkdir(parents=True, exist_ok=True)
     set_seed(tc["seed"])
 
-    samples = dataset.load_samples(data_root)
+    samples = dataset.load_samples(data_root, **dataset.load_options(cfg))
     split = dataset.make_split(samples, tc["split"], tc["seed"], tc["val_frac"], tc["test_frac"])
     dataset.save_split(out / "split.json", samples, split, tc["split"], tc["seed"])  # full split, saved before truncation
     if max_samples:  # smoke runs: truncate each subset, keep the split itself intact

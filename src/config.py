@@ -20,7 +20,8 @@ DEFAULTS: dict = {
     "train": {"split": "session", "seed": 1234, "epochs": 30, "batch_size": 64, "lr": 0.002,
               "weight_decay": 1e-4, "label_smoothing": 0.0, "class_weighted": False,
               "val_frac": 0.1, "test_frac": 0.2},
-    "data": {"min_per_jamo": 25, "min_per_special": 25},
+    "data": {"min_per_jamo": 25, "min_per_special": 25, "sessions": None, "on_missing_mel": "error",
+             "require_param_hash": False},
     "eval": {"n_bins": 15},
 }
 
@@ -46,6 +47,11 @@ def validate(cfg: dict) -> dict:
         raise ValueError("infer.top_n must be in [1, 38]")
     if cfg["infer"]["temperature"] <= 0:
         raise ValueError("infer.temperature must be > 0")
+    d = cfg["data"]
+    if d["on_missing_mel"] not in ("error", "drop"):
+        raise ValueError("data.on_missing_mel must be error | drop")
+    if d["sessions"] is not None and not (isinstance(d["sessions"], list) and all(isinstance(x, str) for x in d["sessions"])):
+        raise ValueError("data.sessions must be null or a list of session ids")
     if cfg["train"]["split"] not in ("session", "participant", "random"):
         raise ValueError("train.split must be session | participant | random")
     return cfg

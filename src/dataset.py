@@ -3,24 +3,33 @@
 Layout (option A of §3.1, "pre-computed tensors keyed by clip_id"):
     <root>/labels/<session_id>.csv   columns: onset_s, jamo, keytype, shift, scenario, participant [, clip_id]
     <root>/mel/<clip_id>.npy         float32 (64,48) or (1,64,48), final z-scored log-mel
+    <root>/mel/_meta.json            the Mel component's header: mel_spec_version, param_hash, ...
+    <root>/mel_packed/<session_id>.npz   optional session shard, used instead of mel/*.npy for that session:
+                                     logmel (N,64,48) float32, clip_id (N,) str, param_hash, mel_spec_version
 
 `session_id` is the CSV file stem. If the CSV has no `clip_id` column, clip_id is `<session_id>_<row:05d>`
 (row = 0-based data row), which is the name the Mel component is expected to write. Pure numpy/stdlib.
+
+The log-mel's `param_hash` (shard header, else mel/_meta.json) must equal the frozen regime's (NFR-2): a
+different hash raises RegimeError; data that carries no hash only warns unless `require_hash` is set.
 """
 from __future__ import annotations
 
 import csv
 import json
+import warnings
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 
 from . import labels
-from .melio import REGIME, load_clip
+from .melio import REGIME, Regime, RegimeError, check_logmel, load_clip
 
 REQUIRED_COLUMNS = ("onset_s", "jamo", "keytype", "shift", "scenario", "participant")
+MISSING_POLICIES = ("error", "drop")  # a CSV row without a log-mel: raise, or leave the row out (counted)
 
 
 @dataclass(frozen=True)
@@ -34,17 +43,92 @@ class Sample:
     label: int
     onset_s: float
     mel_path: Path
+    shard: Path | None = None  # set when the clip is read from mel_packed/<session_id>.npz
 
 
-def load_samples(root: str | Path, *, check_files: bool = True) -> list[Sample]:
+# ---- session shards ---------------------------------------------------------------------------
+@lru_cache(maxsize=None)
+def _shard(path: str, mtime_ns: int) -> tuple[dict[str, int], np.ndarray, str | None]:
+    with np.load(path, allow_pickle=False) as z:
+        logmel, ids = z["logmel"], z["clip_id"].tolist()
+        h = str(z["param_hash"]) if "param_hash" in z.files else None
+    if logmel.ndim != 3 or len(logmel) != len(ids):
+        raise RegimeError(f"shard {path}: logmel {logmel.shape} / clip_id ({len(ids)},) are inconsistent")
+    return {c: i for i, c in enumerate(ids)}, logmel, h
+
+
+def read_shard(path: str | Path) -> tuple[dict[str, int], np.ndarray, str | None]:
+    """(clip_id -> row, logmel (N,n_mels,frames), param_hash or None); cached until the file changes."""
+    p = Path(path)
+    return _shard(str(p), p.stat().st_mtime_ns)
+
+
+def shard_path(root: Path, session_id: str) -> Path | None:
+    p = root / "mel_packed" / f"{session_id}.npz"
+    return p if p.exists() else None
+
+
+# ---- param_hash (NFR-2) -----------------------------------------------------------------------
+def mel_param_hashes(root: str | Path, session_ids: list[str]) -> dict[str, str | None]:
+    """The param_hash each session's log-mel was extracted under: its shard header, else mel/_meta.json."""
+    root = Path(root)
+    meta_path = root / "mel" / "_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8")).get("param_hash") if meta_path.exists() else None
+    out = {}
+    for sid in session_ids:
+        sp = shard_path(root, sid)
+        out[sid] = read_shard(sp)[2] if sp else meta
+    return out
+
+
+def verify_param_hash(root: str | Path, session_ids: list[str], regime: Regime = REGIME, *,
+                      require: bool = False) -> str:
+    """Raise RegimeError if any session's log-mel was extracted under another regime. Returns the expected hash."""
+    want = regime.param_hash()
+    got = mel_param_hashes(root, session_ids)
+    bad = {sid: h for sid, h in got.items() if h is not None and h != want}
+    if bad:
+        raise RegimeError(f"log-mel of {len(bad)} session(s) (e.g. {sorted(bad)[:3]}) was extracted under param_hash "
+                          f"{sorted(set(bad.values()))}, the frozen regime is {want} (NFR-2); re-extract it")
+    unknown = sorted(sid for sid, h in got.items() if h is None)
+    if unknown:
+        msg = (f"{len(unknown)} session(s) carry no param_hash (no mel/_meta.json, no shard header), "
+               f"e.g. {unknown[:3]}: the regime cannot be verified (NFR-2)")
+        if require:
+            raise RegimeError(msg)
+        warnings.warn(msg, stacklevel=3)
+    return want
+
+
+# ---- loading ----------------------------------------------------------------------------------
+def load_dataset(root: str | Path, *, check_files: bool = True, sessions: list[str] | None = None,
+                 on_missing: str = "error", verify_hash: bool = True,
+                 require_hash: bool = False) -> tuple[list[Sample], dict]:
+    """Samples of every label CSV (or only `sessions`) + info {param_hash, sessions, shard_sessions, dropped_no_mel}.
+
+    on_missing="error" raises when a row has no log-mel (when check_files); "drop" leaves such rows out and
+    counts them (the Mel component reports why it skipped them)."""
+    if on_missing not in MISSING_POLICIES:
+        raise ValueError(f"on_missing must be one of {MISSING_POLICIES}, got {on_missing!r}")
     root = Path(root)
     csvs = sorted((root / "labels").glob("*.csv"))
+    if sessions is not None:
+        unknown = sorted(set(sessions) - {p.stem for p in csvs})
+        if unknown:
+            raise FileNotFoundError(f"no label CSV for session(s) {unknown} under {root / 'labels'}")
+        csvs = [p for p in csvs if p.stem in set(sessions)]
     if not csvs:
         raise FileNotFoundError(f"no label CSVs under {root / 'labels'}")
     out: list[Sample] = []
     missing: list[str] = []
+    dropped = 0
+    shard_sessions = []
     for path in csvs:
         sid = path.stem
+        shard = shard_path(root, sid)
+        in_shard = read_shard(shard)[0] if shard else None
+        if shard:
+            shard_sessions.append(sid)
         with open(path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             absent = [c for c in REQUIRED_COLUMNS if c not in (reader.fieldnames or [])]
@@ -54,13 +138,31 @@ def load_samples(root: str | Path, *, check_files: bool = True) -> list[Sample]:
                 symbol = labels.symbol_of(row["keytype"].strip(), (row["jamo"] or "").strip())
                 cid = (row.get("clip_id") or "").strip() or f"{sid}_{i:05d}"
                 mp = root / "mel" / f"{cid}.npy"
-                if check_files and not mp.exists():
-                    missing.append(str(mp))
+                if check_files or on_missing == "drop":
+                    present = cid in in_shard if shard else mp.exists()
+                    if not present:
+                        if on_missing == "drop":
+                            dropped += 1
+                            continue
+                        missing.append(f"{shard}:{cid}" if shard else str(mp))
                 out.append(Sample(cid, sid, row["participant"].strip(), row["scenario"].strip(), row["keytype"].strip(),
-                                  symbol, labels.label_index(symbol), float(row["onset_s"]), mp))
+                                  symbol, labels.label_index(symbol), float(row["onset_s"]), mp, shard))
     if missing:
         raise FileNotFoundError(f"{len(missing)} log-mel files missing, e.g. {missing[:3]}")
-    return out
+    used = [p.stem for p in csvs]
+    want = verify_param_hash(root, used, require=require_hash) if verify_hash else REGIME.param_hash()
+    return out, {"param_hash": want, "sessions": used, "shard_sessions": shard_sessions, "dropped_no_mel": dropped}
+
+
+def load_samples(root: str | Path, *, check_files: bool = True, **options) -> list[Sample]:
+    """`load_dataset` without the info dict. `options`: sessions, on_missing, verify_hash, require_hash."""
+    return load_dataset(root, check_files=check_files, **options)[0]
+
+
+def load_options(cfg: dict) -> dict:
+    """load_samples options from the config's `data` section."""
+    d = cfg["data"]
+    return {"sessions": d["sessions"], "on_missing": d["on_missing_mel"], "require_hash": d["require_param_hash"]}
 
 
 # ---- splitting ------------------------------------------------------------------------------
@@ -124,7 +226,11 @@ class LogMelDataset:
         s = self.samples[i]
         x = self._cache.get(i) if self._cache is not None else None
         if x is None:
-            x = load_clip(s.mel_path, REGIME)[None]
+            if s.shard is not None:
+                index, logmel, _ = read_shard(s.shard)
+                x = check_logmel(logmel[index[s.clip_id]], REGIME)[None]
+            else:
+                x = load_clip(s.mel_path, REGIME)[None]
             if self._cache is not None:
                 self._cache[i] = x
         return x, s.label
@@ -162,20 +268,36 @@ def coverage_report(samples: list[Sample], min_per_jamo: int = 25, min_per_speci
     return {"ok": not short, "n_samples": len(samples), "counts": {k: total[k] for k in labels.LABELS}, "short": short}
 
 
+EXIT_REGIME = 3  # the log-mel's param_hash does not match the frozen regime
+
+
 def main(argv: list[str] | None = None) -> None:
+    """Coverage check (T8/§7). Exit 0 = ok, 1 = coverage short, 3 = param_hash mismatch (NFR-2)."""
     import argparse
+    import sys
 
     from .config import load_config
 
-    ap = argparse.ArgumentParser(description="Check label/mel coverage of a dataset root")
+    ap = argparse.ArgumentParser(description="Check label/mel coverage and the param_hash of a dataset root")
     ap.add_argument("--data", required=True)
     ap.add_argument("--config", default=None)
+    ap.add_argument("--json", default=None, help="also write the full report (coverage, hash, sessions) here")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
-    rep = coverage_report(load_samples(args.data), cfg["data"]["min_per_jamo"], cfg["data"]["min_per_special"])
+    try:
+        samples, info = load_dataset(args.data, **load_options(cfg))
+    except RegimeError as e:
+        print(f"RegimeError: {e}", file=sys.stderr)
+        raise SystemExit(EXIT_REGIME) from None
+    rep = coverage_report(samples, cfg["data"]["min_per_jamo"], cfg["data"]["min_per_special"])
     print(json.dumps({k: rep[k] for k in ("ok", "n_samples")}, indent=1))
     for row in rep["short"][:40]:
         print(f"  short: {row['participant']:>10} {row['symbol']:>8} have {row['have']} < {row['need']}")
+    if args.json:
+        doc = {**info, "n_samples": rep["n_samples"], "participants": sorted({s.participant for s in samples}),
+               "split": cfg["train"]["split"], "coverage_ok": rep["ok"], "coverage_short": rep["short"],
+               "counts": rep["counts"]}
+        Path(args.json).write_text(json.dumps(doc, indent=1, ensure_ascii=False), encoding="utf-8")
     raise SystemExit(0 if rep["ok"] else 1)
 
 
