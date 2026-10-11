@@ -121,3 +121,17 @@ def test_cli_writes_json_and_exits_3_on_a_foreign_hash(root, tmp_path):
     with pytest.raises(SystemExit) as e:
         dataset.main(["--data", str(root), "--config", str(cfg)])
     assert e.value.code == dataset.EXIT_REGIME
+
+
+def test_cli_survives_a_console_that_cannot_print_jamo(root, tmp_path, monkeypatch):
+    import io
+    import sys
+
+    out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")  # a piped stdout on Windows
+    monkeypatch.setattr(sys, "stdout", out)
+    with pytest.raises(SystemExit) as e:  # default minimums: coverage short, jamo printed
+        dataset.main(["--data", str(root), "--json", str(tmp_path / "check.json")])
+    assert e.value.code == 1
+    out.flush()
+    assert "\\u3131" in out.buffer.getvalue().decode("cp1252")  # ㄱ, escaped instead of crashing
+    assert json.loads((tmp_path / "check.json").read_text(encoding="utf-8"))["coverage_ok"] is False

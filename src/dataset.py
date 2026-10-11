@@ -290,14 +290,16 @@ def main(argv: list[str] | None = None) -> None:
         print(f"RegimeError: {e}", file=sys.stderr)
         raise SystemExit(EXIT_REGIME) from None
     rep = coverage_report(samples, cfg["data"]["min_per_jamo"], cfg["data"]["min_per_special"])
-    print(json.dumps({k: rep[k] for k in ("ok", "n_samples")}, indent=1))
-    for row in rep["short"][:40]:
-        print(f"  short: {row['participant']:>10} {row['symbol']:>8} have {row['have']} < {row['need']}")
     if args.json:
         doc = {**info, "n_samples": rep["n_samples"], "participants": sorted({s.participant for s in samples}),
                "split": cfg["train"]["split"], "coverage_ok": rep["ok"], "coverage_short": rep["short"],
                "counts": rep["counts"]}
         Path(args.json).write_text(json.dumps(doc, indent=1, ensure_ascii=False), encoding="utf-8")
+    if hasattr(sys.stdout, "reconfigure"):  # a piped Windows stdout (cp1252) cannot encode jamo: escape, don't crash
+        sys.stdout.reconfigure(errors="backslashreplace")
+    print(json.dumps({k: rep[k] for k in ("ok", "n_samples")}, indent=1))
+    for row in rep["short"][:40]:
+        print(f"  short: {row['participant']:>10} {row['symbol']:>8} have {row['have']} < {row['need']}")
     raise SystemExit(0 if rep["ok"] else 1)
 
 
